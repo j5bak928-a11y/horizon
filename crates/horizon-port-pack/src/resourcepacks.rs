@@ -460,15 +460,31 @@ pub fn stage(source: &Path, work: &Path, pack: &import::Pack) -> Result<Report, 
 
 /// Obtain index-listed client resource packs with the same host and checksum rules as mod jars.
 pub fn fetch(work: &Path, log: pipeline::Log) -> Result<Report, String> {
-    fetch_with(work, log, &|url, hash, dest| {
-        crate::fetch::download(url, Some(hash), dest, false)
+    fetch_with(work, log, &|url, file, dest| {
+        crate::fetch::download_verified(url, file, dest, false)
     })
+}
+
+/// A resource-pack index must supply a well-formed hash. Like mod jars, SHA-512
+/// takes precedence, including when the index also supplies a SHA-1.
+fn indexed_digest(file: &import::PackFile) -> Result<(&str, bool), String> {
+    let (hash, sha512, expected_len, algorithm) = if let Some(hash) = file.sha512.as_deref() {
+        (hash, true, 128, "SHA-512")
+    } else if let Some(hash) = file.sha1.as_deref() {
+        (hash, false, 40, "SHA-1")
+    } else {
+        return Err("resource-pack download has no SHA-512 or SHA-1 checksum".into());
+    };
+    if hash.len() != expected_len || !hash.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("resource-pack download has invalid {algorithm} checksum"));
+    }
+    Ok((hash, sha512))
 }
 
 fn fetch_with(
     work: &Path,
     log: pipeline::Log,
-    download: &dyn Fn(&str, &str, &Path) -> Result<(), String>,
+    download: &dyn Fn(&str, &import::PackFile, &Path) -> Result<(), String>,
 ) -> Result<Report, String> {
     let pack: import::Pack = pipeline::read_json(&work.join("pack.json"))?;
     let cache = crate::modrinth::Cache::load(&work.join("modrinth.json"));
@@ -488,11 +504,7 @@ fn fetch_with(
             if file.path.split('/').count() != 2 || !file.path.ends_with(".zip") {
                 return Err("indexed resource packs must name resourcepacks/<name>.zip".into());
             }
-            let hash = file
-                .sha1
-                .as_deref()
-                .filter(|h| h.len() == 40 && h.bytes().all(|c| c.is_ascii_hexdigit()))
-                .ok_or("resource-pack download has no valid SHA-1")?;
+            let (hash, sha512) = indexed_digest(file)?;
             let root = work.join("resourcepacks");
             directory(work, &root)?;
             let dest = root.join(file.file_name());
@@ -503,8 +515,13 @@ fn fetch_with(
                     }
                     let bytes =
                         read_limited(fs::File::open(&dest).map_err(|e| e.to_string())?, MAX_BYTES)?;
+                    let observed = if sha512 {
+                        import::sha512_hex(&bytes)
+                    } else {
+                        import::sha1_hex(&bytes)
+                    };
                     return Ok(Outcome {
-                        state: if import::sha1_hex(&bytes).eq_ignore_ascii_case(hash) {
+                        state: if observed.eq_ignore_ascii_case(hash) {
                             State::Available
                         } else {
                             State::Conflict
@@ -521,7 +538,7 @@ fn fetch_with(
                     detail: "no permitted download link in the pack".into(),
                 });
             };
-            download(&url, hash, &dest)?;
+            download(&url, file, &dest)?;
             Ok(Outcome {
                 state: State::Available,
                 detail:

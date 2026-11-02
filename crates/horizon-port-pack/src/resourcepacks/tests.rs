@@ -283,7 +283,7 @@ fn indexed_downloads_are_hash_checked_and_failures_do_not_discard_other_packs() 
     };
     let mut excluded = file("server");
     excluded.client = "unsupported".into();
-    let mut missing = file("missing");
+    let missing = file("missing");
     missing.downloads = vec!["https://untrusted.example/pack.zip".into()];
     let mut no_hash = file("nohash");
     no_hash.sha1 = None;
@@ -292,13 +292,13 @@ fn indexed_downloads_are_hash_checked_and_failures_do_not_discard_other_packs() 
         ..import::Pack::default()
     };
     pipeline::write_json(&t.work().join("pack.json"), &pack).unwrap();
-    let report = fetch_with(&t.work(), &|_| {}, &|url, hash, dest| {
+    let report = fetch_with(&t.work(), &|_| {}, &|url, file, dest| {
         let bytes: &[u8] = if url.ends_with("bad.zip") {
             b"corrupt"
         } else {
             b"pack"
         };
-        crate::fetch::store_download(bytes, Some(hash), dest, false)
+        crate::fetch::store_download_verified(bytes, file, dest, false)
     })
     .unwrap();
     assert_eq!(
@@ -337,6 +337,116 @@ fn indexed_downloads_are_hash_checked_and_failures_do_not_discard_other_packs() 
     assert_eq!(
         fs::read(t.work().join("resourcepacks/good.zip")).unwrap(),
         b"user edit"
+    );
+}
+
+#[test]
+fn indexed_sha512_only_resource_pack_downloads_and_preserves_modified_files() {
+    let t = Temp::new();
+    fs::create_dir(t.work()).unwrap();
+    let bytes = b"sha512 resource-pack contents";
+    let file = import::PackFile {
+        path: "resourcepacks/sha512.zip".into(),
+        sha512: Some(import::sha512_hex(bytes).to_uppercase()),
+        downloads: vec!["https://cdn.modrinth.com/sha512.zip".into()],
+        ..import::PackFile::default()
+    };
+    let pack = import::Pack {
+        files: vec![file],
+        ..import::Pack::default()
+    };
+    pipeline::write_json(&t.work().join("pack.json"), &pack).unwrap();
+
+    let report = fetch_with(&t.work(), &|_| {}, &|_, file, dest| {
+        assert!(file.sha1.is_none(), "SHA-512-only files must be accepted");
+        crate::fetch::store_download_verified(&bytes[..], file, dest, false)
+    })
+    .unwrap();
+    let dest = t.work().join("resourcepacks/sha512.zip");
+    assert_eq!(report.files["resourcepacks/sha512.zip"].state, State::Available);
+    assert_eq!(fs::read(&dest).unwrap(), bytes);
+
+    let again = fetch_with(&t.work(), &|_| {}, &|_, _, _| {
+        panic!("a verified existing pack must not be downloaded again")
+    })
+    .unwrap();
+    assert_eq!(again.files["resourcepacks/sha512.zip"].state, State::Available);
+
+    let home = t.0.join("profile");
+    let published = install(&t.work(), &home).unwrap();
+    assert_eq!(published.files["resourcepacks/sha512.zip"].state, State::Available);
+    put(&home.join("resourcepacks/sha512.zip"), b"player's customized pack");
+    let republished = install(&t.work(), &home).unwrap();
+    assert_eq!(
+        republished.files["resourcepacks/sha512.zip"].state,
+        State::Conflict
+    );
+    assert_eq!(
+        fs::read(home.join("resourcepacks/sha512.zip")).unwrap(),
+        b"player's customized pack"
+    );
+
+    put(&dest, b"modified staged pack");
+    let modified = fetch_with(&t.work(), &|_| {}, &|_, _, _| {
+        panic!("a modified existing pack must not be overwritten")
+    })
+    .unwrap();
+    assert_eq!(modified.files["resourcepacks/sha512.zip"].state, State::Conflict);
+    assert_eq!(fs::read(&dest).unwrap(), b"modified staged pack");
+}
+
+#[test]
+fn indexed_resource_packs_refuse_missing_invalid_and_mismatched_hashes() {
+    let t = Temp::new();
+    fs::create_dir(t.work()).unwrap();
+    let file = |name: &str| import::PackFile {
+        path: format!("resourcepacks/{name}.zip"),
+        downloads: vec![format!("https://cdn.modrinth.com/{name}.zip")],
+        ..import::PackFile::default()
+    };
+    let mut missing = file("missing");
+    let mut invalid_sha512 = file("bad-sha512");
+    invalid_sha512.sha512 = Some("not hex".into());
+    invalid_sha512.sha1 = Some(import::sha1_hex(b"correct bytes"));
+    let mut invalid_sha1 = file("bad-sha1");
+    invalid_sha1.sha1 = Some("g".repeat(40));
+    let mut corrupt = file("corrupt");
+    corrupt.sha512 = Some(import::sha512_hex(b"correct bytes"));
+    let mut stronger = file("stronger");
+    stronger.sha512 = Some(import::sha512_hex(b"correct bytes"));
+    stronger.sha1 = Some(import::sha1_hex(b"wrong bytes"));
+    let pack = import::Pack {
+        files: vec![missing, invalid_sha512, invalid_sha1, corrupt, stronger],
+        ..import::Pack::default()
+    };
+    pipeline::write_json(&t.work().join("pack.json"), &pack).unwrap();
+    let report = fetch_with(&t.work(), &|_| {}, &|url, file, dest| {
+        let bytes: &[u8] = if url.ends_with("corrupt.zip") {
+            b"corrupt bytes"
+        } else {
+            b"correct bytes"
+        };
+        crate::fetch::store_download_verified(bytes, file, dest, false)
+    })
+    .unwrap();
+    for name in ["missing", "bad-sha512", "bad-sha1", "corrupt"] {
+        assert_eq!(
+            report.files[&format!("resourcepacks/{name}.zip")].state,
+            State::Failed,
+            "{name}"
+        );
+        assert!(!t.work().join(format!("resourcepacks/{name}.zip")).exists());
+    }
+    assert!(
+        report.files["resourcepacks/bad-sha512.zip"]
+            .detail
+            .contains("SHA-512"),
+        "an invalid stronger digest must not fall back to a valid SHA-1"
+    );
+    assert_eq!(report.files["resourcepacks/stronger.zip"].state, State::Available);
+    assert_eq!(
+        fs::read(t.work().join("resourcepacks/stronger.zip")).unwrap(),
+        b"correct bytes"
     );
 }
 

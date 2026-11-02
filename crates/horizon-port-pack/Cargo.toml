@@ -14,6 +14,7 @@ serde = { version = "1", features = ["derive"] }
 # upgrade), and Java reads them exactly.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha1 = "0.10"
+sha2 = "0.10"
 toml = "1.1.6"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 zip = { version = "9.1.3", default-features = false, features = ["deflate"] }

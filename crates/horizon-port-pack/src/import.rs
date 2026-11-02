@@ -42,6 +42,9 @@ pub struct PackFile {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha1: Option<String>,
+    /// Stronger Modrinth checksum. SHA-512-only `.mrpack` files must retain it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha512: Option<String>,
     /// `required`, `optional` or `unsupported`; empty when not stated.
     pub client: String,
     pub server: String,
@@ -163,6 +166,7 @@ pub fn mrpack(index: &Value, names: &[String]) -> Pack {
         .map(|f| PackFile {
             path: str_of(f, "path"),
             sha1: f["hashes"]["sha1"].as_str().map(str::to_owned),
+            sha512: f["hashes"]["sha512"].as_str().map(str::to_owned),
             client: str_of(&f["env"], "client"),
             server: str_of(&f["env"], "server"),
             downloads: f["downloads"]
@@ -372,6 +376,14 @@ pub fn sha1_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+pub fn sha512_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha512};
+    Sha512::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,10 +418,65 @@ mod tests {
         );
         assert_eq!(p.files[0].sha1.as_deref(), Some("ab"));
         assert_eq!(p.files[1].kind(), "resourcepacks");
+        assert_eq!(p.files[0].sha512, None);
         assert_eq!(
             p.overrides,
             BTreeMap::from([("config".into(), 2), ("kubejs".into(), 1)])
         );
+    }
+
+    #[test]
+    fn mrpack_sha512_only_survives_json_roundtrip() {
+        assert_eq!(
+            sha512_hex(b"abc"),
+            concat!(
+                "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a",
+                "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+            )
+        );
+        let checksum = sha512_hex(b"jar bytes");
+        let index = json!({"name": "SHA512 pack", "files": [{
+            "path": "mods/check.jar", "hashes": {"sha512": checksum},
+            "downloads": ["https://cdn.modrinth.com/data/check.jar"]
+        }]});
+        let pack = mrpack(&index, &[]);
+        assert_eq!(pack.files[0].sha512.as_deref(), Some(checksum.as_str()));
+        assert_eq!(pack.files[0].sha1, None);
+        let restored: Pack = serde_json::from_str(&serde_json::to_string(&pack).unwrap()).unwrap();
+        assert_eq!(restored.files[0].sha512.as_deref(), Some(checksum.as_str()));
+    }
+
+    #[test]
+    fn sha512_only_mrpack_archive_imports_without_sha1() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-sha512-mrpack-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pack.mrpack");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        zip.start_file("modrinth.index.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let checksum = sha512_hex(b"mod jar");
+        write!(
+            zip,
+            "{}",
+            json!({"name": "Only SHA512", "files": [{
+                "path": "mods/example.jar",
+                "hashes": {"sha512": checksum},
+                "downloads": ["https://cdn.modrinth.com/example.jar"]
+            }]})
+        )
+        .unwrap();
+        zip.finish().unwrap();
+        let pack = import(&path).unwrap();
+        assert_eq!(pack.files.len(), 1);
+        assert_eq!(pack.files[0].sha512.as_deref(), Some(checksum.as_str()));
+        assert!(pack.files[0].sha1.is_none());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
