@@ -296,6 +296,28 @@ fn refuses_what_the_instance_cannot_run() {
 }
 
 #[test]
+fn java_instances_never_install_horizon_shader_packs() {
+    let home = home("reject-hshader");
+    let mut source = Fake::default();
+    source.release("horizon-sky", Kind::Shader, "1", &["1.21.1"], &["horizon"], &[]);
+    let shader = source.project("horizon-sky").unwrap();
+    for loader in [None, Some("fabric"), Some("neoforge")] {
+        let instance = target("1.21.1", loader);
+        assert!(!instance.takes(Kind::Shader));
+        let refusal = instance.folder(Kind::Shader).unwrap_err();
+        assert!(refusal.contains(".hshader") && refusal.contains("Java"));
+        assert_eq!(plan(&source, &instance, &shader).unwrap_err(), refusal);
+        assert_eq!(
+            install(&source, &instance, &shader, &home, NONE).unwrap_err(),
+            refusal
+        );
+    }
+    assert!(!home.join("shaderpacks").exists());
+    assert!(!home.join("mod-browser.json").exists());
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn the_page_search_keeps_the_players_filters_but_not_their_version() {
     let t = target("1.21.1", Some("fabric"));
     let picked = details::Filters {

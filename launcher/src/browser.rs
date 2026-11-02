@@ -309,7 +309,10 @@ pub fn support(kind: Kind, game_versions: &[String], loaders: &[String]) -> Supp
         Kind::Modpack => {
             Support::Partial("Horizon runs the mods it can port, from your own downloads.".into())
         }
-        Kind::Shader => Support::No("Not one of Horizon's own shader packs.".into()),
+        Kind::Shader => Support::No(
+            "This is not a Horizon WGSL .hshader pack. Java and legacy Iris/OptiFine shader formats are separate and cannot be installed from Horizon's registry tab."
+                .into(),
+        ),
         Kind::DataPack => {
             let made_for = match newest_release(game_versions) {
                 _ if game_versions.iter().any(|v| v == GAME) => String::new(),

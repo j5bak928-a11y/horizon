@@ -413,6 +413,17 @@ impl Launcher {
         let m = &mut self.mods;
         m.search += 1;
         m.searching = true;
+        // Horizon's registry only has .hshader packs. Never search it for a Java instance:
+        // those files cannot run there, and Modrinth's Java shaders are not offered yet.
+        if m.kind == PackKind::Shader && m.java.is_some() {
+            m.searching = false;
+            m.searched = true;
+            m.more = false;
+            m.error = None;
+            m.results.clear();
+            m.results_list.reset();
+            return;
+        }
         if offset == 0 {
             if !keep {
                 m.results.clear();
@@ -583,6 +594,9 @@ impl Launcher {
         std::thread::spawn(move || {
             let mut found = HashMap::new();
             for e in entries {
+                if java.is_some() && e.kind == PackKind::Shader {
+                    continue;
+                }
                 let Some(source) = browser::source(e.source) else {
                     continue;
                 };
@@ -718,6 +732,13 @@ impl Launcher {
                         Some(p) => p,
                         None => source.project(&id)?,
                     };
+                    // A project page, stale update or future caller must never install a
+                    // Horizon .hshader into the selected Java instance's game folder.
+                    if let Some(target) = java.as_ref() {
+                        if p.kind == PackKind::Shader {
+                            target.folder(p.kind)?;
+                        }
+                    }
                     if let Some(target) = java.as_ref().filter(|t| t.takes(p.kind)) {
                         let done = java_instance::install(&*source, target, &p, &home, &progress)?;
                         let names: Vec<String> = done
@@ -877,6 +898,9 @@ impl Launcher {
         // Another version or loader: other results, on the page's next draw.
         if java != self.mods.java {
             self.mods.asked = false;
+            // Don't leave a Horizon shader project open after switching to a Java instance.
+            self.mods.browse.open = None;
+            self.mods.browse.filters = Default::default();
         }
         self.mods.java = java;
         if !self.mods.loaded || (home.is_some() && self.mods.home != home) {
@@ -901,9 +925,13 @@ impl Launcher {
         }
         let header = page_header(
             "Mods",
-            "Mods and shader packs made for Horizon from its own reviewed registry, and \
-             resource packs from Modrinth. Each file is checked against its source's checksum \
-             before it reaches your game folder.",
+            if self.mods.java.is_some() {
+                "Java mods are matched to the selected Minecraft version and mod loader; resource packs to the Minecraft version. Horizon-only packs do not run in Java Edition."
+            } else {
+                "Mods and shader packs made for Horizon from its own reviewed registry, and \
+                 resource packs from Modrinth. Each file is checked against its source's checksum \
+                 before it reaches your game folder."
+            },
             &t,
         );
         let this = cx.entity().downgrade();
@@ -950,14 +978,15 @@ impl Launcher {
         // shown, inert, never searched (like the Microsoft account's "Coming soon").
         // A Java instance's mods and resource packs come from Modrinth, for its version.
         let java = self.mods.java_for(self.mods.kind).is_some();
+        let unavailable_shaders = self.mods.java.is_some() && self.mods.kind == PackKind::Shader;
         let source_note = (source_for(self.mods.kind) == SourceId::Modrinth && !java)
             .then(|| div().flex().child(self.mods_source_switch(cx)));
         // The registry lists only what was made for Horizon: no "everything", no Modrinth filters,
         // only its sort.
         let registry = self.mods.source == SourceId::Horizon && !java;
-        let filters = (!registry).then(|| self.mods_filters(cx));
+        let filters = (!registry && !unavailable_shaders).then(|| self.mods_filters(cx));
         // The registry's sort sits below the GitHub row, above the list it orders.
-        let registry_sort = registry.then(|| self.mods_sort_bar(cx));
+        let registry_sort = (registry && !unavailable_shaders).then(|| self.mods_sort_bar(cx));
         let controls = div()
             .flex()
             .flex_col()
@@ -995,7 +1024,10 @@ impl Launcher {
                 .child(div().h(px(2.)).bg(t.rule))
                 .child(section_title("Browse modpacks", "search", &t));
         }
-        body = body.child(controls);
+        if !unavailable_shaders {
+            body = body.child(controls);
+        }
+        body = body.children(self.mods_compatibility_note());
         // Native mods from a GitHub link: Horizon instances, on the Mods tab.
         if self.mods.kind == PackKind::Mod && self.mods.java.is_none() {
             body = body.child(self.github_panel(cx));
@@ -1011,6 +1043,9 @@ impl Launcher {
     /// A modpack becomes an instance of its own.
     fn mods_target_line(&self, cx: &mut Context<Self>) -> Option<Div> {
         let instance = self.selected_instance()?;
+        if self.mods.java.is_some() && self.mods.kind == PackKind::Shader {
+            return None;
+        }
         if self.mods.kind == PackKind::DataPack {
             return Some(self.mods_world_picker(&instance.name.clone(), cx));
         }
@@ -1028,6 +1063,50 @@ impl Launcher {
                 )
             },
         ))
+    }
+
+    /// Context-specific compatibility notice: a Java .jar, a Horizon mod and the two shader
+    /// formats are not interchangeable. Links use a normal keyboard-focusable button.
+    fn mods_compatibility_note(&self) -> Option<Div> {
+        let (title, explanation, guide) = match (self.mods.java.as_ref(), self.mods.kind) {
+            (Some(_), PackKind::Shader) => (
+                tr("Java shaders: not supported in this browser"),
+                tr("Horizon .hshader packs only work in Horizon. Java shader packs use a different format and need a compatible Java shader loader. This launcher does not offer or install Java shader packs; use the Java instance's own shader setup instead."),
+                "https://github.com/horizon-rust/horizon/blob/main/docs/mod-browser.md",
+            ),
+            (None, PackKind::Shader) => (
+                tr("Horizon shader packs (.hshader)"),
+                tr("These packs use Horizon's WGSL shader API, not the Iris/OptiFine shader format. Legacy shader packs are a separate feature and are not offered by this registry tab. Enable a Horizon pack in the game's Shader Packs settings."),
+                "https://github.com/horizon-rust/horizon/blob/main/docs/shaders.md",
+            ),
+            (Some(_), PackKind::Mod) => (
+                tr("Java mods (.jar)"),
+                tr("Java mods are installed unchanged into this Java instance for its Minecraft version and mod loader. They do not run as Java code in Horizon's Rust game."),
+                "https://github.com/horizon-rust/horizon/blob/main/docs/mod-browser.md",
+            ),
+            (None, PackKind::Mod) => (
+                tr("Horizon mods (.hmod / .hnmod)"),
+                tr("The registry offers mods made for Horizon. Java mod .jar code does not run in Horizon; its supported content can be ported separately, but a port is not the original Java mod."),
+                "https://github.com/horizon-rust/horizon/blob/main/docs/mods.md",
+            ),
+            _ => return None,
+        };
+        let t = self.theme;
+        Some(
+            plate(&t)
+                .p(px(16.))
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(text(theme::LABEL).text_color(t.ink).child(title))
+                .child(text(theme::CAPTION).text_color(t.ink_soft).child(explanation))
+                .child(
+                    div().flex().child(
+                        button("mods-compatibility-guide", "Compatibility guide", Kind::Secondary, &t)
+                            .on_click(move |_, _, cx| cx.open_url(guide)),
+                    ),
+                ),
+        )
     }
 
     /// The world data packs go into: one of the instance's, picked here.
@@ -1214,7 +1293,12 @@ impl Launcher {
             let key = (e.source, e.project.clone());
             let is_native = self.mods.java.is_none() && native_status::is_native_file(&e.file);
             let mut right = div().flex().items_center().gap(px(8.));
-            if let Some(number) = self.mods.updates.get(&key) {
+            if let Some(number) = self
+                .mods
+                .updates
+                .get(&key)
+                .filter(|_| !(self.mods.java.is_some() && e.kind == PackKind::Shader))
+            {
                 let mut update = button(
                     SharedString::from(format!("mods-update-{}", e.project)),
                     trf("Update to {version}", &[("version", number)]),
@@ -1589,6 +1673,11 @@ impl Launcher {
     fn mods_results(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let m = &self.mods;
+        if m.kind == PackKind::Shader && m.java.is_some() {
+            // The compatibility notice gives an actionable explanation instead of pretending
+            // an empty Horizon registry search means Java shaders are supported.
+            return div();
+        }
         if let Some(e) = &m.error {
             return div().child(notice(e.clone(), &t));
         }

@@ -16,13 +16,18 @@ mods, `.hnmod`) aren't on Modrinth or CurseForge yet (Modrinth has no `horizon` 
 | Java mods (Fabric, NeoForge, Forge, Quilt) | ported into `horizon-mods/<mod id>/` and turned on | Checked from its jar before install: **Works**, **Partly** or **Doesn't run** ([below](#java-mods)) |
 | Resource packs | `resourcepacks/` beside `options.txt` | **Works** when made for 26.3 ([resource-packs.md](resource-packs.md) lists what Horizon reads). Older packs are **Partly**: they load with vanilla's compatibility warning |
 | Modpacks (`.mrpack`, CurseForge zip) | the Modpacks page's import | **Partly**: Horizon runs the mods it can port, from the player's own downloads ([modpacks.md](modpacks.md)) |
-| Shader packs (`.hshader`, Horizon's registry only) | `shaderpacks/` beside `options.txt` | **Works** when made for 26.3: checked by the game's own check before install ([shaders.md](shaders.md)). The `shaders/`-format packs on Modrinth and CurseForge are not offered |
-| Data packs (Modrinth) | `datapacks/` of the world picked on the **Data packs** tab (`mods install <pack> --world <world>`); not in the Installed list: each world's list on Home has them | **Partly**: Horizon runs a data pack's functions, function tags, predicates and item modifiers, not yet its recipes, loot tables, advancements, other tags or worldgen. The install reads the zip and says what of it runs; a pack with none of those (worldgen only, such as Tectonic) is refused |
+| Shader packs (`.hshader`, Horizon's registry only) | `shaderpacks/` beside `options.txt` in a Horizon instance | **Experimental:** the game validates the WGSL pack before loading ([shaders.md](shaders.md)). Existing Iris/OptiFine `shaders/`-format packs are a separate, partially compatible loader and are not offered through the registry browser. Java instances cannot install Horizon `.hshader` packs. |
+| Data packs (Modrinth) | `datapacks/` of the world picked on the **Data packs** tab (`mods install <pack> --world <world>`); not in the Installed list: each world's list on Home has them | **Partly:** the installer now recognizes data files consumed by Horizon, including functions, predicates, recipes, loot tables, advancements, tags and supported world-generation categories. It distinguishes limited-format support and refuses packs with no recognized valid content; a recognized file alone does not guarantee that every codec or gameplay behavior works. |
 
 Mods, resource packs and shader packs go into the game folder of the instance selected in the sidebar, and the
 Installed list, updates and Remove are that instance's: picking another instance reads its list. The page says which
 instance it installs into when there is more than one. The CLI's `mods list|install|update|remove|enable|disable` take
 `--instance <name>` (default: the selected one). A modpack becomes an instance of its own.
+
+For a **Java Edition instance**, the launcher installs compatible Java `.jar` mods for its Minecraft version and
+installed Fabric or Quilt loader; these mods execute in the Java game. For a **Horizon instance**, the same Java
+jar is only examined for portable data and assets; its Java code does not execute. The Mods page explains the
+selection and does not offer Horizon-only shader packages to Java instances.
 
 By default a search shows only what runs: Java mods made for 26.3, resource packs made for 26.3, and every modpack. **Show everything** lists the rest of the kind too, each marked with how well it runs; what doesn't run is
 never offered for install.

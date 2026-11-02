@@ -70,6 +70,13 @@ pub(super) enum VersionList {
     Failed(String),
 }
 
+impl VersionList {
+    /// An unsuccessful request can be retried without closing the instance dialog.
+    fn can_request(&self) -> bool {
+        matches!(self, Self::NotAsked | Self::Failed(_))
+    }
+}
+
 impl Launcher {
     fn java_choice(&mut self) -> Option<&mut JavaChoice> {
         self.instances.dialog.as_mut().map(|d| &mut d.java)
@@ -105,7 +112,14 @@ impl Launcher {
     /// Picks the dialog's kind; a Java one fetches Mojang's list the first time.
     pub(super) fn pick_kind(&mut self, kind: NewKind, cx: &mut Context<Self>) {
         self.change(|j| j.kind = kind);
-        if kind == NewKind::Horizon || !matches!(self.instances.versions, VersionList::NotAsked) {
+        if kind == NewKind::Horizon {
+            return;
+        }
+        self.request_versions(cx);
+    }
+
+    fn request_versions(&mut self, cx: &mut Context<Self>) {
+        if !self.instances.versions.can_request() {
             return;
         }
         self.instances.versions = VersionList::Loading;
@@ -187,8 +201,19 @@ impl Launcher {
             VersionList::NotAsked | VersionList::Loading => shell::text(night::UI, c(n.muted))
                 .child(tr("Asking Mojang for its versions…").to_string())
                 .into_any_element(),
-            VersionList::Failed(e) => shell::text(night::UI, c(n.danger))
-                .child(e.clone())
+            VersionList::Failed(e) => div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(shell::text(night::UI, c(n.danger)).child(e.clone()))
+                .child(
+                    shell::action("mc-versions-retry", Action::Raised, &t)
+                        .child(shell::label(tr("Try again").to_string()))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.request_versions(cx);
+                            cx.notify();
+                        })),
+                )
                 .into_any_element(),
             VersionList::Ready(versions) => {
                 let rows: Vec<_> = versions
@@ -357,5 +382,18 @@ mod tests {
         assert_eq!(choice.minecraft(None), None);
         choice.version = Some("1.20.1".into());
         assert_eq!(choice.minecraft(None).as_deref(), Some("1.20.1"));
+    }
+
+    #[test]
+    fn version_list_request_recovers_from_failure_without_duplicate_requests() {
+        assert!(VersionList::NotAsked.can_request());
+        assert!(VersionList::Failed("offline".into()).can_request());
+        assert!(!VersionList::Loading.can_request());
+        assert!(!VersionList::Ready(Versions {
+            latest_release: "26.3".into(),
+            latest_snapshot: String::new(),
+            all: Vec::new(),
+        })
+        .can_request());
     }
 }

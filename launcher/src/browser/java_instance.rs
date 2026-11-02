@@ -3,6 +3,7 @@
 //! (nothing is ported). The instance's `mod-browser.json` lists them, as for Horizon's folder.
 use super::installed::{self, Entry, Installed, Step};
 use super::{details, Kind, Project, Query, Source, Version};
+use crate::i18n::tr;
 use std::fs;
 use std::path::Path;
 
@@ -39,7 +40,10 @@ impl Target {
             Kind::ResourcePack => Ok("resourcepacks"),
             Kind::Modpack => Err("A modpack is imported as its own instance.".into()),
             Kind::DataPack => Err("A data pack goes in a world.".into()),
-            Kind::Shader => Err("Shader packs for Java instances aren't supported yet.".into()),
+            Kind::Shader => Err(tr(
+                "Horizon .hshader packs cannot run in Java Edition. Java shader packs use a different format and require a compatible Java shader loader; this launcher does not install them yet. See docs/mod-browser.md.",
+            )
+            .into()),
         }
     }
 

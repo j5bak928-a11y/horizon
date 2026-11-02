@@ -9,7 +9,12 @@
 use crate::sources::{fetch_checked, sha1_file, write_file, Fetch};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::fs;
 use std::path::Path;
+
+// Loader metadata is small; never trust an arbitrarily large or damaged local cache.
+const MAX_VERSION_LIST_BYTES: usize = 1024 * 1024;
 
 /// A mod loader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,17 +116,67 @@ pub fn parse_versions(text: &str) -> Result<Vec<Listed>, String> {
     Ok(listed)
 }
 
-/// `kind`'s versions for `minecraft`.
+/// `kind`'s versions for `minecraft`. A successfully checked response is kept for when
+/// the loader's metadata service is unreachable on a later launch.
 pub fn versions(kind: Kind, minecraft: &str, fetch: Fetch) -> Result<Vec<Listed>, String> {
-    let body = fetch(&format!("{}/versions/loader/{minecraft}", kind.meta()))?;
-    let listed = parse_versions(&String::from_utf8_lossy(&body))?;
-    if listed.is_empty() {
-        return Err(format!(
-            "{} has no loader for Minecraft {minecraft}.",
-            kind.name()
-        ));
+    let cache = crate::backend::data_dir()
+        .join("minecraft")
+        .join("loader-metadata");
+    versions_in(kind, minecraft, &cache, fetch)
+}
+
+/// Cache files are keyed by both loader and Minecraft version. Hashing the version makes
+/// arbitrary version IDs safe to use as keys without treating them as filesystem paths.
+fn version_cache_file(kind: Kind, minecraft: &str, cache: &Path) -> std::path::PathBuf {
+    let key = Sha256::digest(minecraft.as_bytes());
+    cache.join(format!("{}-{key:x}.json", kind.id()))
+}
+
+fn cached_versions(path: &Path) -> Option<Vec<Listed>> {
+    if fs::metadata(path).ok()?.len() > MAX_VERSION_LIST_BYTES as u64 {
+        return None;
     }
-    Ok(listed)
+    let body = fs::read_to_string(path).ok()?;
+    let listed = parse_versions(&body).ok()?;
+    (!listed.is_empty()).then_some(listed)
+}
+
+/// Separate cache root and fetcher let tests verify network loss without touching real accounts
+/// or the launcher's normal data directory.
+fn versions_in(
+    kind: Kind,
+    minecraft: &str,
+    cache: &Path,
+    fetch: Fetch,
+) -> Result<Vec<Listed>, String> {
+    let file = version_cache_file(kind, minecraft, cache);
+    let url = format!("{}/versions/loader/{minecraft}", kind.meta());
+    let live = fetch(&url).and_then(|body| {
+        let text = std::str::from_utf8(&body)
+            .map_err(|e| format!("The loader's version list: {e}"))?;
+        let listed = parse_versions(text)?;
+        Ok((body, listed))
+    });
+    match live {
+        Ok((body, listed)) => {
+            if listed.is_empty() {
+                // An authoritative empty list means unsupported, not a transient failure.
+                // Replace any previous positive cache with this negative result, so a later
+                // offline request cannot resurrect a loader that the service removed.
+                let _ = write_file(&file, b"[]");
+                return Err(format!(
+                    "{} has no loader for Minecraft {minecraft}.",
+                    kind.name()
+                ));
+            }
+            if body.len() <= MAX_VERSION_LIST_BYTES {
+                // A failed cache write must not prevent a valid online selection.
+                let _ = write_file(&file, &body);
+            }
+            Ok(listed)
+        }
+        Err(error) => cached_versions(&file).ok_or(error),
+    }
 }
 
 /// The loader `kind` names at `version` (none or `latest`: the newest stable one) for

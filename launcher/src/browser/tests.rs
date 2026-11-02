@@ -51,6 +51,22 @@ fn support_by_kind() {
 }
 
 #[test]
+fn horizon_shader_support_does_not_claim_java_shader_compatibility() {
+    assert_eq!(
+        support(Kind::Shader, &v(&[GAME]), &v(&[horizon::LOADER])),
+        Support::Works
+    );
+    let legacy = support(Kind::Shader, &v(&[GAME]), &v(&["iris"]));
+    assert!(matches!(legacy, Support::No(_)));
+    assert!(!legacy.installable());
+    assert!(legacy.reason().unwrap().contains(".hshader"));
+    assert!(matches!(
+        support(Kind::Shader, &v(&["1.21.1"]), &v(&[horizon::LOADER])),
+        Support::No(_)
+    ));
+}
+
+#[test]
 fn picks_the_newest_version_that_runs() {
     let versions = [
         version("snapshot", &["26.4-snapshot-5"], &["minecraft"]),

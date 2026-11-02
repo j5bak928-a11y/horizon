@@ -68,6 +68,88 @@ fn maven_names_are_paths() {
 }
 
 #[test]
+fn loader_versions_reuse_verified_cache_offline_and_refresh_when_online() {
+    let cache = std::env::temp_dir().join(format!(
+        "horizon-loader-version-cache-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&cache);
+    let old = br#"[{"loader":{"version":"0.18.1-beta.1","stable":false}},
+                  {"loader":{"version":"0.17.0","stable":true}}]"#;
+    let newer = br#"[{"loader":{"version":"0.18.0","stable":true}}]"#;
+    let online = |url: &str| {
+        assert_eq!(url, "https://meta.fabricmc.net/v2/versions/loader/1.21.4");
+        Ok(old.to_vec())
+    };
+    let versions = versions_in(Kind::Fabric, "1.21.4", &cache, &online).unwrap();
+    assert_eq!(pick(Kind::Fabric, &versions, None).unwrap(), "0.17.0");
+    let offline = |_: &str| Err("no network".to_string());
+    let cached = versions_in(Kind::Fabric, "1.21.4", &cache, &offline).unwrap();
+    assert_eq!(cached, versions);
+    // An authoritative empty list is not a network error and must override stale metadata.
+    assert!(versions_in(Kind::Fabric, "1.21.4", &cache, &|_| Ok(b"[]".to_vec()))
+        .unwrap_err()
+        .contains("no loader for Minecraft 1.21.4"));
+    // An empty response also retires the previous positive cache: an offline request
+    // must not resurrect a loader the metadata service explicitly stopped offering.
+    assert_eq!(
+        versions_in(Kind::Fabric, "1.21.4", &cache, &offline).unwrap_err(),
+        "no network"
+    );
+    // A successful response must update the offline selection, never keep stale versions.
+    let refreshed = versions_in(Kind::Fabric, "1.21.4", &cache, &|_| Ok(newer.to_vec())).unwrap();
+    assert_eq!(pick(Kind::Fabric, &refreshed, None).unwrap(), "0.18.0");
+    assert_eq!(
+        pick(
+            Kind::Fabric,
+            &versions_in(Kind::Fabric, "1.21.4", &cache, &offline).unwrap(),
+            None,
+        )
+        .unwrap(),
+        "0.18.0"
+    );
+    // One loader's list must not be reused for another loader or Minecraft version.
+    assert_eq!(
+        versions_in(Kind::Quilt, "1.21.4", &cache, &offline).unwrap_err(),
+        "no network"
+    );
+    assert_eq!(
+        versions_in(Kind::Fabric, "1.20.1", &cache, &offline).unwrap_err(),
+        "no network"
+    );
+    fs::remove_dir_all(&cache).unwrap();
+}
+
+#[test]
+fn invalid_loader_cache_cannot_invent_a_version() {
+    let cache = std::env::temp_dir().join(format!(
+        "horizon-loader-version-invalid-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&cache);
+    fs::create_dir_all(&cache).unwrap();
+    let file = version_cache_file(Kind::Quilt, "26.3", &cache);
+    fs::write(&file, b"not valid metadata").unwrap();
+    let offline = |_: &str| Err("no network".to_string());
+    assert_eq!(
+        versions_in(Kind::Quilt, "26.3", &cache, &offline).unwrap_err(),
+        "no network"
+    );
+    let fresh = br#"[{"loader":{"version":"0.28.0"}},{"loader":{"version":"0.29.0-beta.1"}}]"#;
+    let valid = versions_in(Kind::Quilt, "26.3", &cache, &|_| Ok(fresh.to_vec())).unwrap();
+    assert_eq!(pick(Kind::Quilt, &valid, None).unwrap(), "0.28.0");
+    // A corrupt online result may use a previously checked cache, not its invalid data.
+    let fallback = versions_in(Kind::Quilt, "26.3", &cache, &|_| Ok(b"{".to_vec())).unwrap();
+    assert_eq!(fallback, valid);
+    fs::write(&file, vec![b'x'; MAX_VERSION_LIST_BYTES + 1]).unwrap();
+    assert_eq!(
+        versions_in(Kind::Quilt, "26.3", &cache, &offline).unwrap_err(),
+        "no network"
+    );
+    fs::remove_dir_all(&cache).unwrap();
+}
+
+#[test]
 fn a_profile_comes_with_its_libraries_checked() {
     let dir = std::env::temp_dir().join(format!("horizon-loaders-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
