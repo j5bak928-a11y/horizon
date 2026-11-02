@@ -13,6 +13,28 @@ use zip::ZipArchive;
 
 const ROOT: &str = "shaders";
 
+/// Limits apply to the entire archive, not just `shaders/`: ZIPs can contain decoys, duplicate
+/// entries and highly compressible files. Keep one ordinary high-resolution texture affordable
+/// while refusing archives whose declared expansion could exhaust a player's memory.
+#[derive(Clone, Copy)]
+struct ZipLimits {
+    archive: u64,
+    entries: usize,
+    compressed_entry: u64,
+    compressed_total: u64,
+    expanded_entry: u64,
+    expanded_total: u64,
+}
+
+const ZIP_LIMITS: ZipLimits = ZipLimits {
+    archive: 256 * 1024 * 1024,
+    entries: 8192,
+    compressed_entry: 128 * 1024 * 1024,
+    compressed_total: 256 * 1024 * 1024,
+    expanded_entry: 64 * 1024 * 1024,
+    expanded_total: 512 * 1024 * 1024,
+};
+
 pub struct Pack {
     name: String,
     files: Files,
@@ -28,6 +50,7 @@ enum Files {
     Zip {
         archive: ZipArchive<Cursor<Arc<[u8]>>>,
         entries: BTreeMap<String, usize>,
+        expanded_entry_limit: u64,
     },
 }
 
@@ -35,6 +58,7 @@ enum Files {
 pub enum PackError {
     Io(io::Error),
     Zip(String),
+    Limit(String),
     /// A readable folder or archive with no `shaders` folder at its root.
     NoShadersFolder,
 }
@@ -44,6 +68,7 @@ impl fmt::Display for PackError {
         match self {
             Self::Io(e) => write!(f, "{e}"),
             Self::Zip(e) => write!(f, "not a readable zip: {e}"),
+            Self::Limit(e) => write!(f, "shader zip exceeds safety limit: {e}"),
             Self::NoShadersFolder => f.write_str("no shaders folder at the root of the pack"),
         }
     }
@@ -70,7 +95,18 @@ impl Pack {
             }
             Files::Folder(root)
         } else {
-            Self::zip_files(fs::read(path)?)?
+            // Checking the metadata alone is racy: also cap the actual bytes read in case the
+            // file changes while loading it.
+            let file = fs::File::open(path)?;
+            if file.metadata()?.len() > ZIP_LIMITS.archive {
+                return Err(PackError::Limit(format!(
+                    "archive exceeds {} bytes",
+                    ZIP_LIMITS.archive
+                )));
+            }
+            let mut bytes = Vec::new();
+            file.take(ZIP_LIMITS.archive + 1).read_to_end(&mut bytes)?;
+            Self::zip_files(bytes)?
         };
         Ok(Self {
             name,
@@ -90,10 +126,50 @@ impl Pack {
     }
 
     fn zip_files(bytes: Vec<u8>) -> Result<Files, PackError> {
-        let archive = ZipArchive::new(Cursor::new(Arc::from(bytes)))
+        Self::zip_files_with_limits(bytes, ZIP_LIMITS)
+    }
+
+    fn zip_files_with_limits(bytes: Vec<u8>, limits: ZipLimits) -> Result<Files, PackError> {
+        if bytes.len() as u64 > limits.archive {
+            return Err(PackError::Limit(format!(
+                "archive exceeds {} bytes",
+                limits.archive
+            )));
+        }
+        let mut archive = ZipArchive::new(Cursor::new(Arc::from(bytes)))
             .map_err(|e| PackError::Zip(e.to_string()))?;
+        if archive.len() > limits.entries {
+            return Err(PackError::Limit(format!(
+                "{} entries exceeds the {}-entry limit",
+                archive.len(),
+                limits.entries
+            )));
+        }
         let mut entries = BTreeMap::new();
+        let (mut compressed_total, mut expanded_total) = (0u64, 0u64);
         for i in 0..archive.len() {
+            let file = archive
+                .by_index_raw(i)
+                .map_err(|e| PackError::Zip(e.to_string()))?;
+            let (compressed, expanded) = (file.compressed_size(), file.size());
+            if compressed > limits.compressed_entry || expanded > limits.expanded_entry {
+                return Err(PackError::Limit(format!(
+                    "entry {i} is too large ({compressed} compressed, {expanded} expanded bytes)"
+                )));
+            }
+            compressed_total = compressed_total.checked_add(compressed).ok_or_else(|| {
+                PackError::Limit("compressed entry sizes overflow".to_owned())
+            })?;
+            expanded_total = expanded_total.checked_add(expanded).ok_or_else(|| {
+                PackError::Limit("expanded entry sizes overflow".to_owned())
+            })?;
+            if compressed_total > limits.compressed_total || expanded_total > limits.expanded_total {
+                return Err(PackError::Limit(format!(
+                    "total entries exceed {} compressed or {} expanded bytes",
+                    limits.compressed_total, limits.expanded_total
+                )));
+            }
+            drop(file);
             let Some(name) = archive.name_for_index(i) else {
                 continue;
             };
@@ -110,7 +186,11 @@ impl Pack {
         if entries.is_empty() {
             return Err(PackError::NoShadersFolder);
         }
-        Ok(Files::Zip { archive, entries })
+        Ok(Files::Zip {
+            archive,
+            entries,
+            expanded_entry_limit: limits.expanded_entry,
+        })
     }
 
     /// The pack with options at the values in `chosen` (name to value, `true` or `false` for a
@@ -136,13 +216,23 @@ impl Pack {
         let path = normalize(path)?;
         match &self.files {
             Files::Folder(root) => fs::read(root.join(&path)).ok(),
-            Files::Zip { archive, entries } => {
+            Files::Zip {
+                archive,
+                entries,
+                expanded_entry_limit,
+            } => {
                 // A clone shares the bytes and the central directory; reading needs `&mut`.
                 let mut archive = archive.clone();
-                let mut entry = archive.by_index(*entries.get(&path)?).ok()?;
-                let mut out = Vec::with_capacity(entry.size() as usize);
-                entry.read_to_end(&mut out).ok()?;
-                Some(out)
+                let entry = archive.by_index(*entries.get(&path)?).ok()?;
+                // Do not trust ZIP's declared length when inflating. `take` also bounds a
+                // corrupt entry that produces more bytes than its central directory claims.
+                if entry.size() > *expanded_entry_limit {
+                    return None;
+                }
+                let mut out = Vec::new();
+                out.try_reserve(usize::try_from(entry.size()).ok()?).ok()?;
+                entry.take(expanded_entry_limit + 1).read_to_end(&mut out).ok()?;
+                (out.len() as u64 <= *expanded_entry_limit).then_some(out)
             }
         }
     }
@@ -296,6 +386,14 @@ pub(crate) mod tests {
         assert!(!pack.exists("License.txt"));
         assert_eq!(pack.list("lang"), ["en_US.lang", "fr_FR.lang"]);
         assert_eq!(pack.list(""), ["shaders.properties"]);
+
+        // The disk entry point applies the same checks without reading an unlimited archive.
+        let root = temp_dir("zip-on-disk");
+        let path = root.join("P.zip");
+        fs::write(&path, zip(&[("shaders/shaders.properties", "sun=false")])).unwrap();
+        let from_disk = Pack::open(&path).unwrap();
+        assert_eq!(from_disk.read_text("shaders.properties"), Some("sun=false".into()));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -308,6 +406,83 @@ pub(crate) mod tests {
         assert!(matches!(
             Pack::from_zip_bytes("P.zip", b"not a zip".to_vec()),
             Err(PackError::Zip(_))
+        ));
+    }
+
+    #[test]
+    fn zip_limits_reject_archive_entry_and_expansion_budgets() {
+        // A highly compressible input expands many times beyond its archive size.
+        let bytes = zip(&[
+            ("shaders/a.glsl", vec![b'A'; 4096]),
+            ("shaders/b.glsl", vec![b'B'; 4096]),
+        ]);
+        assert!(bytes.len() < 4096);
+        let rejected = |limits: ZipLimits| match Pack::zip_files_with_limits(bytes.clone(), limits)
+        {
+            Err(PackError::Limit(reason)) => reason,
+            Err(error) => panic!("expected a size limit, got {error}"),
+            Ok(_) => panic!("expected the archive to be rejected"),
+        };
+
+        let mut limits = ZIP_LIMITS;
+        limits.archive = bytes.len() as u64 - 1;
+        assert!(rejected(limits).contains("archive"));
+
+        let mut limits = ZIP_LIMITS;
+        limits.entries = 1;
+        assert!(rejected(limits).contains("entries"));
+
+        let mut limits = ZIP_LIMITS;
+        limits.compressed_entry = 1;
+        assert!(rejected(limits).contains("entry"));
+
+        let mut limits = ZIP_LIMITS;
+        limits.compressed_total = 1;
+        assert!(rejected(limits).contains("total"));
+
+        let mut limits = ZIP_LIMITS;
+        limits.expanded_entry = 4095;
+        assert!(rejected(limits).contains("entry"));
+
+        let mut limits = ZIP_LIMITS;
+        limits.expanded_total = 8191;
+        assert!(rejected(limits).contains("total"));
+
+        // Under an applicable budget, data is still read correctly, not truncated.
+        let mut limits = ZIP_LIMITS;
+        limits.expanded_entry = 4096;
+        limits.expanded_total = 8192;
+        let Files::Zip {
+            archive,
+            entries,
+            expanded_entry_limit,
+        } = Pack::zip_files_with_limits(bytes, limits).unwrap()
+        else {
+            panic!("expected ZIP files");
+        };
+        let pack = Pack {
+            name: "bounded.zip".into(),
+            files: Files::Zip {
+                archive,
+                entries,
+                expanded_entry_limit,
+            },
+            chosen: BTreeMap::new(),
+        };
+        assert_eq!(pack.read("a.glsl"), Some(vec![b'A'; 4096]));
+    }
+
+    #[test]
+    fn duplicate_zip_entries_still_count_toward_the_entry_limit() {
+        let bytes = zip(&[
+            ("shaders/a.glsl", "first"),
+            ("shaders/a.glsl", "second"),
+        ]);
+        let mut limits = ZIP_LIMITS;
+        limits.entries = 1;
+        assert!(matches!(
+            Pack::zip_files_with_limits(bytes, limits),
+            Err(PackError::Limit(_))
         ));
     }
 

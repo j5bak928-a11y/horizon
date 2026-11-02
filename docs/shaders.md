@@ -7,6 +7,19 @@ signature, input, resource and limit is in the generated [api/shaders-reference.
 Shader packs in the Iris/OptiFine format are a separate feature with its own loader; this page is only about
 Horizon's own format.
 
+## Choosing a shader pack
+
+| Format | Where to get it | Current compatibility |
+| --- | --- | --- |
+| Horizon `.hshader` / WGSL folder | Horizon registry in the launcher's **Shader packs** tab, or a local pack | Experimental API 0.1; sky, terrain material, weather, shadow and post stages, with validation and hot reload. Material shaders do not currently replace entity or particle materials. |
+| Existing `shaders/` folder or ZIP (Iris/OptiFine format) | Place a local pack in `shaderpacks/` and select it in-game | Experimental clean-room GLSL loader. Terrain, shadow and post-processing support exists, but pack features and visual output are not yet universally compatible. |
+
+The launcher's shader registry currently installs only Horizon's `.hshader` format; it does not automatically convert
+an Iris/OptiFine pack. A pack loading successfully does not prove that it renders exactly as it does in Minecraft
+Java with Iris/OptiFine. Some shader-pack modes disable Horizon's HDR lighting, temporal antialiasing and frame
+generation; see [graphics settings](graphics.md) for the relevant combinations. When diagnosing an incompatible pack,
+first try a plain world without other packs, then check the in-game diagnostics for unsupported features.
+
 | Part | Where | State |
 |---|---|---|
 | Format, stages, check | `crates/horizon-shader-api` | API 0.1, experimental |

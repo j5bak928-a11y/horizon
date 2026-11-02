@@ -144,6 +144,46 @@ pub(super) struct PackIds {
     pub(super) separate_ao: bool,
 }
 
+/// `entity.properties` and `item.properties` determine their own unknown-ID fallback.
+/// An absent file means zero; a present file reserves the format's missing ID.
+fn named_pack_ids(
+    pack: &Pack,
+    macros: &Macros,
+    kind: &str,
+    missing: i32,
+) -> (HashMap<String, i32>, i32) {
+    let text = pack.read_text(&format!("{kind}.properties"));
+    let ids = BlockIds::parse_kind(
+        &Properties::parse(text.as_deref().unwrap_or_default(), macros),
+        kind,
+    );
+    (ids.plain(), if text.is_some() { missing } else { 0 })
+}
+
+/// The notes from `read_properties` are unsupported *required* Iris capabilities, not merely
+/// warnings. Loading the pipeline anyway would allow incorrect or unusable shader output.
+fn check_required_features(notes: &[String]) -> Result<(), String> {
+    if notes.is_empty() {
+        Ok(())
+    } else {
+        // The list comes from untrusted shader properties; keep the UI/error log bounded.
+        let details = notes
+            .iter()
+            .take(8)
+            .map(|note| note.chars().take(160).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let remaining = if notes.len() > 8 {
+            format!("; and {} more", notes.len() - 8)
+        } else {
+            String::new()
+        };
+        Err(format!(
+            "unsupported required Iris shader features: {details}{remaining}"
+        ))
+    }
+}
+
 impl Game<'_> {
     /// Loads the pack for the current dimension when it changed, and returns this frame's
     /// inputs to the pack's uniforms.
@@ -195,7 +235,7 @@ impl Game<'_> {
             let started = std::time::Instant::now();
             // A pack is not the game's own code: one that makes the shader compiler (or our
             // translation of it) panic is turned off instead of crashing every world load (#3525).
-            let loaded = horizon_client::crash::contain(|| {
+            let loaded = horizon_client::crash::contain(|| -> Result<(), String> {
                 match Pack::open(&path).map(|p| p.with_chosen(chosen_shader_options(name))) {
                     Ok(pack) => {
                         let mut macros = Macros::standard();
@@ -203,9 +243,7 @@ impl Game<'_> {
                         // Its conditionals test the pack's options too.
                         let (properties, notes) =
                             horizon_shaders::read_properties(&pack, &mut macros);
-                        for note in notes {
-                            log::warn!("shader pack {name}: {note}");
-                        }
+                        check_required_features(&notes)?;
                         for note in &properties.notes {
                             log::warn!(
                                 "shader pack {name}: shaders.properties:{}: {}",
@@ -238,19 +276,12 @@ impl Game<'_> {
                         for note in &ids.notes {
                             log::warn!("shader pack {name}: block.properties: {note}");
                         }
-                        let text = pack.read_text("entity.properties");
-                        let entities = BlockIds::parse_kind(
-                            &Properties::parse(text.as_deref().unwrap_or_default(), &macros),
-                            "entity",
-                        );
-                        let text = pack.read_text("item.properties");
-                        let items = BlockIds::parse_kind(
-                            &Properties::parse(text.as_deref().unwrap_or_default(), &macros),
-                            "item",
-                        );
+                        let (entities, missing_entity) =
+                            named_pack_ids(&pack, &macros, "entity", 65535);
+                        let (items, missing_item) = named_pack_ids(&pack, &macros, "item", -1);
                         self.pack_ids = Some(PackIds {
-                            items: items.plain(),
-                            missing_item: if text.is_some() { -1 } else { 0 },
+                            items,
+                            missing_item,
                             // OQ-21: on unless the pack turns it off.
                             old_hand_light: properties
                                 .get("oldHandLight")
@@ -264,8 +295,8 @@ impl Game<'_> {
                                 .get("oldLighting")
                                 .is_some_and(|v| v.trim() == "true"),
                             separate_ao,
-                            entities: entities.plain(),
-                            missing_entity: if text.is_some() { 65535 } else { 0 },
+                            entities,
+                            missing_entity,
                             missing_block: if ids.is_empty() { 0 } else { 65535 },
                             blocks: ids.clone(),
                             block_states: RefCell::default(),
@@ -294,16 +325,19 @@ impl Game<'_> {
                                 started.elapsed().as_millis()
                             );
                         }
+                        Ok(())
                     }
                     Err(e) => {
                         self.pack_ids = None;
                         log::warn!("shader pack {name}: {e}");
                         renderer.set_shader_pack(dimension, None, &[]);
+                        Ok(())
                     }
                 }
             });
-            if let Err(panic) = loaded {
-                self.shader_pack_failed(name, dimension, &panic);
+            match loaded {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) | Err(error) => self.shader_pack_failed(name, dimension, &error),
             }
         }
         let lerp = |(old, new): (f32, f32)| old + (new - old) * partial;
@@ -435,7 +469,7 @@ impl Game<'_> {
             self.settings.save(&Self::options_path());
         }
         self.system_message(Text::colored(
-            format!("Shader pack {name} could not be loaded and was turned off"),
+            format!("Shader pack {name} could not be loaded and was turned off: {error}"),
             0xFF5555,
         ));
     }
@@ -587,6 +621,72 @@ fn name_id(name: &str) -> i32 {
         hash = (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193);
     }
     hash as i32
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::{check_required_features, named_pack_ids};
+    use horizon_shaders::{Macros, Pack, read_properties};
+
+    #[test]
+    fn required_iris_features_reject_the_pack_before_rendering() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-required-shader-features-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("shaders")).unwrap();
+
+        for (properties, allowed) in [
+            ("iris.features.required = SSBO", true),
+            ("iris.features.optional = UNKNOWN_FEATURE", true),
+            ("iris.features.required = SSBO UNKNOWN_FEATURE", false),
+        ] {
+            std::fs::write(root.join("shaders/shaders.properties"), properties).unwrap();
+            let pack = Pack::open(&root).unwrap();
+            let mut macros = Macros::standard();
+            let (_, notes) = read_properties(&pack, &mut macros);
+            let outcome = check_required_features(&notes);
+            assert_eq!(outcome.is_ok(), allowed, "{properties}");
+            if !allowed {
+                let reason = outcome.unwrap_err();
+                assert!(reason.contains("UNKNOWN_FEATURE"));
+                assert!(reason.contains("unsupported required Iris"));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn entity_and_item_fallbacks_depend_on_their_own_files() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-shader-ids-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("shaders")).unwrap();
+
+        for (has_entities, has_items) in [(false, false), (true, false), (false, true), (true, true)] {
+            for (kind, present, contents) in [
+                ("entity", has_entities, "entity.7=minecraft:zombie\n"),
+                ("item", has_items, "item.11=minecraft:diamond\n"),
+            ] {
+                let path = root.join(format!("shaders/{kind}.properties"));
+                if present {
+                    std::fs::write(path, contents).unwrap();
+                } else {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+            let pack = Pack::open(&root).unwrap();
+            let macros = Macros::standard();
+            let (entities, missing_entity) = named_pack_ids(&pack, &macros, "entity", 65535);
+            let (items, missing_item) = named_pack_ids(&pack, &macros, "item", -1);
+            assert_eq!(missing_entity, if has_entities { 65535 } else { 0 });
+            assert_eq!(missing_item, if has_items { -1 } else { 0 });
+            assert_eq!(entities.get("minecraft:zombie"), has_entities.then_some(&7));
+            assert_eq!(items.get("minecraft:diamond"), has_items.then_some(&11));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 /// `mc_Entity` (x, y) of each block sprite layer, as (id, fluid) pairs: terrain vertices carry

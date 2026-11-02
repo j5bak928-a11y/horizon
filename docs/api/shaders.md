@@ -1,13 +1,14 @@
 # Shader API
 
-Horizon has no shader packs today: the earlier implementation was removed on 2026-10-24. Two things will replace it,
-designed separately: a **Horizon shader API**, described here, and a clean-room loader for the existing pack format
-(its own spec; it is not part of this API). Both sit on the same renderer hooks, agreed between the two.
+Horizon supports two experimental shader formats: its own **WGSL shader API**, documented here, and a
+separate clean-room loader for packs using the `shaders/` format associated with Iris/OptiFine.
+Both use the Rust renderer, but an arbitrary Iris/OptiFine pack is not guaranteed to work. See
+[the shader guide](../shaders.md) for installation and current stage support.
 
-## Overview: what a shader author will be able to do
+## Overview: what shader authors can do
 
-Write WGSL against documented stages of Horizon's renderer, with typed inputs, options the player can change, a
-reload as soon as a file is saved and an overlay that shows what each pass costs and draws. The renderer keeps
+Write WGSL against documented stages of Horizon's renderer, with typed inputs, options the player can change,
+hot reload when a file is saved, and GPU pass timings. The renderer keeps
 everything that makes it fast (culling, batching, LOD, the mesher); a pack changes how surfaces and light look, not
 how the world is fed to the GPU.
 
@@ -144,13 +145,15 @@ the same way every time (files in path order, fixed dates), so a pack's SHA-256 
 
 ## Stability
 
-Not started. The first stages will be experimental (opt-in), then preview once a reference, an example and a test
-pack exist ([stability.md](stability.md)).
+API 0.1 is experimental and opt-in. The stage implementations, reference, authoring tool and an example pack exist;
+the format and supported resources may still change ([stability.md](stability.md)).
 
 ## Not there yet
 
-Option values other than the defaults (the three stages run, with hot reload), then the overlay and lighting
-stages.
+Further renderer coverage remains incomplete. The material stage currently affects terrain, including distant
+terrain, but not entity, block-entity or particle materials. Shader-pack compatibility for the separate
+`shaders/` format is partial; unsupported resources and stage features may prevent particular packs from drawing
+as their authors intended. This document describes the Horizon WGSL API, not the Iris/OptiFine format.
 
 ## Changelog
 
