@@ -2,11 +2,18 @@
 //! the game discovers them (`datapack::discover`). The game turns on every pack it finds there
 //! that `<world>/datapacks.json` doesn't list as disabled, when the world opens or on `/reload`,
 //! so adding one is copying it in.
+use crate::i18n::{tr, trf};
 use crate::packs::{entry, plain};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const SETTINGS: &str = "datapacks.json";
+const MAX_FILES: usize = 65_536;
+const MAX_PACK_BYTES: u64 = 512 << 20;
+const MAX_JSON_BYTES: u64 = 16 << 20;
+const MAX_METADATA_BYTES: u64 = 1 << 20;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DataPack {
@@ -63,29 +70,9 @@ pub fn list(world: &Path) -> Vec<DataPack> {
     packs
 }
 
-/// Whether a zip is a data pack: a `pack.mcmeta` and a `data/` folder.
+/// Checks the archive as well as its contents before a user-controlled zip reaches a world.
 fn check(file: &Path) -> Result<(), String> {
-    let name = file
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let zip = fs::File::open(file)
-        .ok()
-        .and_then(|f| zip::ZipArchive::new(f).ok())
-        .ok_or_else(|| format!("{name} is not a zip file that can be read."))?;
-    if zip.index_for_name("pack.mcmeta").is_none() {
-        return Err(format!("{name} is not a pack: it has no pack.mcmeta."));
-    }
-    let names: Vec<_> = zip
-        .file_names()
-        .collect::<Result<_, _>>()
-        .map_err(|e| format!("{name} has an entry whose name can't be read: {e}"))?;
-    if !names.iter().any(|n| n.starts_with("data/")) {
-        return Err(format!(
-            "{name} has no data folder: it is a resource pack, not a data pack."
-        ));
-    }
-    Ok(())
+    coverage(file).map(|_| ())
 }
 
 /// Copies a data pack zip into the world's `datapacks/` under a free name. The game turns it on
@@ -155,29 +142,43 @@ pub fn remove(world: &Path, pack: &DataPack) -> Result<(), String> {
     forget(world, &pack.file)
 }
 
-/// What of a data pack the game reads today (its `DataStore`): `data/<namespace>/<kind>/`.
-pub const READ: [&str; 4] = ["function", "function tag", "predicate", "item_modifier"];
-
 /// A data pack's files by kind (`function`, `worldgen`, `item tag`...), with how many each.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Coverage {
-    /// What Horizon runs.
+    /// Files read by a Horizon runtime consumer, which may still reject their contents.
     pub read: Vec<(String, usize)>,
-    /// What it doesn't read yet.
+    /// Subset of `read` whose format or gameplay behavior is only partly supported.
+    pub partial: Vec<(String, usize)>,
+    /// Files that no runtime consumer currently reads (and invalid supported files).
     pub unread: Vec<(String, usize)>,
 }
 
 impl Coverage {
-    /// "Runs its 12 functions, 1 predicate. Not read yet: 40 worldgen, 3 recipes."
+    /// Separate recognized data from unrecognized data without promising its behavior works.
     pub fn summary(&self) -> String {
         let runs = match self.read.is_empty() {
-            true => "Nothing in it runs in Horizon yet.".to_string(),
-            false => format!("Runs its {}.", counts(&self.read)),
+            true => tr("No supported data pack files found.").to_string(),
+            false => trf(
+                "Horizon reads its {files} (valid game data required).",
+                &[("files", &counts(&self.read))],
+            ),
         };
-        match self.unread.is_empty() {
-            true => runs,
-            false => format!("{runs} Not read yet: {}.", self.not_read()),
+        let mut lines = runs;
+        if !self.partial.is_empty() {
+            lines.push(' ');
+            lines.push_str(&trf(
+                "Limited support: {files}.",
+                &[("files", &counts(&self.partial))],
+            ));
         }
+        if !self.unread.is_empty() {
+            lines.push(' ');
+            lines.push_str(&trf(
+                "Unsupported or invalid: {files}.",
+                &[("files", &self.not_read())],
+            ));
+        }
+        lines
     }
 
     /// "1077 worldgen, 653 loot tables, 16 recipes": what Horizon doesn't read yet, the six
@@ -199,7 +200,7 @@ fn counts(list: &[(String, usize)]) -> String {
     list.iter()
         .map(|(k, n)| {
             let k = k.replace('_', " ");
-            match *n == 1 || k == "worldgen" {
+            match *n == 1 || k.ends_with("worldgen") {
                 true => format!("{n} {k}"),
                 false => format!("{n} {k}s"),
             }
@@ -208,31 +209,222 @@ fn counts(list: &[(String, usize)]) -> String {
         .join(", ")
 }
 
-/// Counts a data pack zip's files by kind, and splits them into what the game reads and what
-/// it doesn't yet.
+/// Which runtime recognizes this file path. Partial means its consumer may implement only
+/// some behaviors or codec variants, not that the file is guaranteed to change a world.
+fn recognized(name: &str) -> Option<(String, bool)> {
+    let rest = name.strip_prefix("data/")?;
+    let (namespace, path) = rest.split_once('/')?;
+    if namespace.is_empty() {
+        return None;
+    }
+    if let Some(path) = path.strip_prefix("function/") {
+        return path
+            .ends_with(".mcfunction")
+            .then(|| ("function".into(), false));
+    }
+    if !path.ends_with(".json") {
+        return None;
+    }
+    if let Some(tag) = path.strip_prefix("tags/") {
+        let (kind, rest) = tag.split_once('/')?;
+        let (label, partial) = match kind {
+            "function" => ("function tag", false),
+            "worldgen" if rest.starts_with("biome/") => ("biome tag", true),
+            "item" | "block" | "fluid" | "entity_type" | "enchantment" | "damage_type"
+            | "dialog" | "potion" | "villager_trade" | "banner_pattern" | "instrument"
+            | "game_event" => (kind, true),
+            _ => return None,
+        };
+        return Some((
+            if label.ends_with(" tag") {
+                label.into()
+            } else {
+                format!("{label} tag")
+            },
+            partial,
+        ));
+    }
+    if path.starts_with("worldgen/") {
+        let (kind, _) = path.strip_prefix("worldgen/")?.split_once('/')?;
+        if matches!(
+            kind,
+            "biome"
+                | "block_state_provider"
+                | "carver"
+                | "feature"
+                | "density_function"
+                | "material_condition"
+                | "material_rule"
+                | "noise"
+                | "noise_settings"
+                | "placed_feature"
+                | "processor_list"
+                | "structure"
+                | "structure_set"
+                | "template_pool"
+        ) {
+            return Some(("worldgen".into(), true));
+        }
+        return None;
+    }
+    let (kind, _) = path.split_once('/')?;
+    match kind {
+        "predicate" | "item_modifier" => Some((kind.into(), false)),
+        "recipe" | "recipe_filter" | "loot_table" | "advancement" | "trade_set"
+        | "villager_trade" | "dialog" | "data_maps" | "dimension" | "dimension_type" => {
+            Some((kind.into(), true))
+        }
+        _ => None,
+    }
+}
+
+fn safe_zip_path(name: &str) -> bool {
+    let name = name.trim_end_matches('/');
+    !name.is_empty()
+        && name.len() <= 4096
+        && name.split('/').count() <= 64
+        && name.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && !part.ends_with(['.', ' '])
+                && !part.chars().any(|c| c.is_control() || "\\:*?\"<>|".contains(c))
+        })
+}
+
+/// Inspect a zip's paths and bounded contents, then count real runtime-consumed file kinds.
+/// Unknown paths and malformed JSON do not make an otherwise unsupported pack installable.
 pub fn coverage(file: &Path) -> Result<Coverage, String> {
-    let zip = fs::File::open(file)
+    let mut zip = fs::File::open(file)
         .ok()
         .and_then(|f| zip::ZipArchive::new(f).ok())
         .ok_or_else(|| format!("{} is not a zip file that can be read.", file.display()))?;
-    let mut kinds = std::collections::BTreeMap::<String, usize>::new();
-    let names: Vec<_> = zip
-        .file_names()
-        .collect::<Result<_, _>>()
-        .map_err(|e| format!("{}: {e}", file.display()))?;
-    for name in names.iter().filter(|n| !n.ends_with('/')) {
-        let parts: Vec<&str> = name.split('/').collect();
-        let kind = match parts.as_slice() {
-            ["data", _, "tags", tag, _, ..] => format!("{tag} tag"),
-            ["data", _, kind, _, ..] => kind.to_string(),
-            _ => continue,
-        };
-        *kinds.entry(kind).or_default() += 1;
+    if zip.len() > MAX_FILES {
+        return Err(trf(
+            "{file} has too many data pack entries.",
+            &[("file", &file.display().to_string())],
+        ));
     }
-    let (read, unread) = kinds
-        .into_iter()
-        .partition(|(k, _)| READ.contains(&k.as_str()));
-    Ok(Coverage { read, unread })
+    let mut kinds = BTreeMap::<String, (usize, usize, usize)>::new();
+    let mut seen = HashSet::new();
+    let mut total = 0u64;
+    let mut has_data = false;
+    let mut metadata = false;
+    for index in 0..zip.len() {
+        let mut entry = zip.by_index(index).map_err(|e| e.to_string())?;
+        let name = entry.name().map_err(|e| e.to_string())?.into_owned();
+        if !safe_zip_path(&name) {
+            return Err(trf("Unsafe data pack zip path: {name}", &[("name", &name)]));
+        }
+        if entry.unix_mode().is_some_and(|mode| mode & 0o170000 == 0o120000) {
+            return Err(trf(
+                "Data pack contains a symbolic link: {name}",
+                &[("name", &name)],
+            ));
+        }
+        if entry.is_dir() {
+            continue;
+        }
+        if !seen.insert(name.to_lowercase()) {
+            return Err(trf("Duplicate data pack zip entry: {name}", &[("name", &name)]));
+        }
+        total = total
+            .checked_add(entry.size())
+            .ok_or_else(|| tr("Data pack is too large").to_string())?;
+        if total > MAX_PACK_BYTES {
+            return Err(tr("Data pack exceeds 512 MiB unpacked").to_string());
+        }
+        if name == "pack.mcmeta" {
+            if entry.size() > MAX_METADATA_BYTES {
+                return Err(tr("Data pack metadata is too large").to_string());
+            }
+            let mut bytes = Vec::new();
+            entry
+                .take(MAX_METADATA_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("pack.mcmeta: {e}"))?;
+            if bytes.len() as u64 > MAX_METADATA_BYTES {
+                return Err(tr("Data pack metadata is too large").to_string());
+            }
+            let meta: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("pack.mcmeta: {e}"))?;
+            if !meta["pack"].is_object() {
+                return Err(tr("pack.mcmeta has no pack object").to_string());
+            }
+            metadata = true;
+            continue;
+        }
+        if !name.starts_with("data/") {
+            continue;
+        }
+        has_data = true;
+        let Some((kind, partial)) = recognized(&name) else {
+            let label = name
+                .strip_prefix("data/")
+                .and_then(|p| p.split_once('/'))
+                .and_then(|(_, p)| p.split_once('/'))
+                .map_or("unknown", |(kind, _)| match kind {
+                    "tags" => "unsupported tag",
+                    "worldgen" => "unsupported worldgen",
+                    kind => kind,
+                });
+            kinds.entry(label.into()).or_default().2 += 1;
+            continue;
+        };
+        if entry.size() > MAX_JSON_BYTES {
+            return Err(trf(
+                "Data pack file {name} exceeds 16 MiB",
+                &[("name", &name)],
+            ));
+        }
+        let mut bytes = Vec::new();
+        entry
+            .take(MAX_JSON_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("{name}: {e}"))?;
+        if bytes.len() as u64 > MAX_JSON_BYTES {
+            return Err(trf(
+                "Data pack file {name} exceeds 16 MiB",
+                &[("name", &name)],
+            ));
+        }
+        if name.ends_with(".json") {
+            if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+                kinds.entry("invalid JSON".into()).or_default().2 += 1;
+                continue;
+            }
+        } else if std::str::from_utf8(&bytes).is_err() {
+            kinds.entry("invalid function text".into()).or_default().2 += 1;
+            continue;
+        }
+        let counts = kinds.entry(kind).or_default();
+        counts.0 += 1;
+        if partial {
+            counts.1 += 1;
+        }
+    }
+    if !metadata {
+        return Err(tr("Data pack has no pack.mcmeta").to_string());
+    }
+    if !has_data {
+        return Err(
+            tr("Data pack has no data folder: it is a resource pack, not a data pack.")
+                .to_string(),
+        );
+    }
+    let mut coverage = Coverage::default();
+    for (kind, (read, partial, unread)) in kinds {
+        if read > 0 {
+            coverage.read.push((kind.clone(), read));
+        }
+        if partial > 0 {
+            coverage.partial.push((kind.clone(), partial));
+        }
+        if unread > 0 {
+            coverage.unread.push((kind, unread));
+        }
+    }
+    Ok(coverage)
 }
 
 #[cfg(test)]

@@ -343,21 +343,25 @@ fn shader_packs_older_launchers_installed_are_left_alone() {
 
 /// A data pack zip with these files.
 fn datapack_zip(files: &[&str]) -> Vec<u8> {
+    datapack_contents(&files.iter().map(|name| (*name, "{}")).collect::<Vec<_>>())
+}
+
+fn datapack_contents(files: &[(&str, &str)]) -> Vec<u8> {
     use std::io::Write;
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default();
     zip.start_file("pack.mcmeta", options).unwrap();
     zip.write_all(br#"{"pack":{"pack_format":94,"description":"Test"}}"#)
         .unwrap();
-    for name in files {
+    for (name, content) in files {
         zip.start_file(*name, options).unwrap();
-        zip.write_all(b"{}").unwrap();
+        zip.write_all(content.as_bytes()).unwrap();
     }
     zip.finish().unwrap().into_inner()
 }
 
 #[test]
-fn data_packs_go_into_a_world_when_something_in_them_runs() {
+fn data_packs_install_when_the_runtime_consumes_any_files() {
     let world = home("datapack").join("saves/New World");
     fs::create_dir_all(&world).unwrap();
     let mut fake = Fake::default();
@@ -384,6 +388,37 @@ fn data_packs_go_into_a_world_when_something_in_them_runs() {
         &datapack_zip(&["data/t/worldgen/biome/b.json"]),
         false,
     );
+    for (id, path) in [
+        ("recipes", "data/t/recipe/r.json"),
+        ("loot", "data/t/loot_table/l.json"),
+        ("advancements", "data/t/advancement/a.json"),
+        ("tags", "data/t/tags/block/b.json"),
+    ] {
+        let mut pack = project(id, Kind::DataPack);
+        pack.loaders = vec!["datapack".into()];
+        fake.add(pack);
+        fake.release(id, "1.0", &[], &datapack_zip(&[path]), false);
+    }
+    for (id, path) in [
+        ("unknown-worldgen", "data/t/worldgen/unknown_type/z.json"),
+        ("unknown-tags", "data/t/tags/unknown/z.json"),
+        ("wrong-extension", "data/t/recipe/r.txt"),
+    ] {
+        let mut pack = project(id, Kind::DataPack);
+        pack.loaders = vec!["datapack".into()];
+        fake.add(pack);
+        fake.release(id, "1.0", &[], &datapack_zip(&[path]), false);
+    }
+    let mut invalid = project("invalid-json", Kind::DataPack);
+    invalid.loaders = vec!["datapack".into()];
+    fake.add(invalid);
+    fake.release(
+        "invalid-json",
+        "1.0",
+        &[],
+        &datapack_contents(&[("data/t/recipe/a.json", "broken")]),
+        false,
+    );
     let tools = fake.project("tools").unwrap();
     let off = &|_: f32| {};
 
@@ -393,7 +428,8 @@ fn data_packs_go_into_a_world_when_something_in_them_runs() {
     assert_eq!(done.number, "2.0");
     assert_eq!(
         done.coverage.summary(),
-        "Runs its 2 functions, 1 function tag. Not read yet: 1 recipe."
+        "Horizon reads its 2 functions, 1 function tag, 1 recipe (valid game data required). \
+         Limited support: 1 recipe."
     );
     assert!(world.join("datapacks/tools-2.0.zip").is_file());
     // Nothing of it in the browser's own list.
@@ -404,14 +440,31 @@ fn data_packs_go_into_a_world_when_something_in_them_runs() {
     assert_eq!(again.pack.file, "tools-2.0 (2).zip");
 
     let terrain = fake.project("terrain").unwrap();
-    let refused = install_datapack(&fake, &terrain, false, &world, off)
-        .err()
-        .unwrap();
-    assert_eq!(
-        refused,
-        "Pack terrain would change nothing in Horizon yet: it has no functions, predicates or \
-         item modifiers, and Horizon doesn't read its 1 worldgen yet."
-    );
+    let terrain = install_datapack(&fake, &terrain, false, &world, off).unwrap();
+    assert!(terrain
+        .coverage
+        .partial
+        .iter()
+        .any(|(kind, _)| kind == "worldgen"));
+    for id in ["recipes", "loot", "advancements", "tags"] {
+        let done = install_datapack(&fake, &fake.project(id).unwrap(), false, &world, off).unwrap();
+        assert_eq!(
+            done.coverage.read.iter().map(|(_, n)| n).sum::<usize>(),
+            1,
+            "{id}"
+        );
+        assert_eq!(
+            done.coverage.partial.iter().map(|(_, n)| n).sum::<usize>(),
+            1,
+            "{id}"
+        );
+    }
+    for id in ["unknown-worldgen", "unknown-tags", "wrong-extension", "invalid-json"] {
+        let refused = install_datapack(&fake, &fake.project(id).unwrap(), false, &world, off)
+            .err()
+            .unwrap();
+        assert!(refused.contains("no supported data pack files"), "{id}: {refused}");
+    }
     let jar = fake.project("jar").unwrap();
     assert!(install_datapack(&fake, &jar, false, &world, off).is_err());
 
@@ -425,6 +478,6 @@ fn data_packs_go_into_a_world_when_something_in_them_runs() {
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(names.len(), 2, "{names:?}");
+    assert_eq!(names.len(), 7, "{names:?}");
     fs::remove_dir_all(world.parent().unwrap().parent().unwrap()).unwrap();
 }

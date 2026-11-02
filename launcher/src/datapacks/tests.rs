@@ -103,7 +103,7 @@ fn lists_adds_and_removes_as_the_game_reads_them() {
 }
 
 #[test]
-fn coverage_says_what_runs() {
+fn coverage_reports_consumed_partial_and_unread_files() {
     let root = scratch("coverage");
     let file = root.join("p.zip");
     zip_file(
@@ -114,25 +114,87 @@ fn coverage_says_what_runs() {
             ("data/a/predicate/p.json", "{}"),
             ("data/a/item_modifier/m.json", "{}"),
             ("data/a/tags/item/i.json", "{}"),
+            ("data/a/tags/worldgen/biome/has_structure.json", "{}"),
             ("data/a/loot_table/l.json", "{}"),
             ("data/a/loot_table/k.json", "{}"),
             ("data/a/worldgen/biome/b.json", "{}"),
+            ("data/a/worldgen/unknown_type/o.json", "{}"),
             ("assets/a/lang/en_us.json", "{}"),
         ],
     );
     let c = coverage(&file).unwrap();
     assert_eq!(
         c.summary(),
-        "Runs its 1 function, 1 item modifier, 1 predicate. Not read yet: 2 loot tables, 1 item \
-         tag, 1 worldgen."
+        "Horizon reads its 1 biome tag, 1 function, 1 item modifier, 1 item tag, 2 loot tables, \
+         1 predicate, 1 worldgen (valid game data required). Limited support: 1 biome tag, \
+         1 item tag, 2 loot tables, 1 worldgen. Unsupported or invalid: 1 unsupported worldgen."
     );
+    assert_eq!(c.read.iter().map(|(_, n)| n).sum::<usize>(), 8);
+    assert_eq!(c.partial.iter().map(|(_, n)| n).sum::<usize>(), 5);
+    assert_eq!(c.unread, [("unsupported worldgen".into(), 1)]);
     let many = Coverage {
         read: Vec::new(),
         unread: (1..=8).map(|n| (format!("kind{n}"), n)).collect(),
+        ..Coverage::default()
     };
     assert_eq!(
         many.not_read(),
         "8 kind8s, 7 kind7s, 6 kind6s, 5 kind5s, 4 kind4s, 3 kind3s and 2 other kinds"
     );
     fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn data_pack_coverage_requires_recognized_paths_and_valid_json() {
+    let root = scratch("recognized");
+    let file = root.join("data.zip");
+    for (path, content, read) in [
+        ("data/test/recipe/example.json", "{}", true),
+        ("data/test/loot_table/chest.json", "{}", true),
+        ("data/test/advancement/first.json", "{}", true),
+        ("data/test/tags/block/mineable.json", "{}", true),
+        ("data/test/worldgen/noise_settings/overworld.json", "{}", true),
+        ("data/test/dimension_type/surface.json", "{}", true),
+        ("data/test/worldgen/biome/new.json", "{}", true),
+        ("data/test/worldgen/alien/unknown.json", "{}", false),
+        ("data/test/tags/alien/missing.json", "{}", false),
+        ("data/test/recipe/example.txt", "{}", false),
+        ("data/test/recipe/invalid.json", "invalid", false),
+    ] {
+        zip_file(&file, &[("pack.mcmeta", META), (path, content)]);
+        let result = coverage(&file).unwrap();
+        assert_eq!(result.read.iter().map(|(_, n)| n).sum::<usize>() > 0, read, "{path}");
+        if read {
+            assert!(!result.partial.is_empty(), "{path} may have partial runtime support");
+        } else {
+            assert!(!result.unread.is_empty(), "{path}");
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn zip_validation_refuses_unsafe_paths_missing_or_invalid_metadata_and_duplicates() {
+    let root = scratch("unsafe");
+    let file = root.join("data.zip");
+    for name in [
+        "../escape",
+        "/absolute",
+        "data/../escape",
+        "data/x\\bad",
+        "C:/drive",
+    ] {
+        zip_file(&file, &[("pack.mcmeta", META), (name, "{}")]);
+        assert!(coverage(&file).is_err(), "{name}");
+    }
+    zip_file(&file, &[("data/a/recipe/a.json", "{}")]);
+    assert!(coverage(&file).unwrap_err().contains("pack.mcmeta"));
+    zip_file(
+        &file,
+        &[("pack.mcmeta", "broken"), ("data/a/recipe/a.json", "{}")],
+    );
+    assert!(coverage(&file).unwrap_err().contains("pack.mcmeta"));
+    zip_file(&file, &[("pack.mcmeta", META), ("pack.mcmeta", META)]);
+    assert!(coverage(&file).unwrap_err().contains("Duplicate"));
+    fs::remove_dir_all(root).unwrap();
 }

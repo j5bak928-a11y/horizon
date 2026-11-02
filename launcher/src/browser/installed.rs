@@ -328,7 +328,9 @@ pub struct DataPackInstall {
 }
 
 /// Downloads a project's data pack (checksum checked) into the world folder `world`, under a
-/// free name. Refused when nothing in it runs in Horizon yet. It isn't recorded with the
+/// free name. Refused when no file is consumed by Horizon's current data pack loaders.
+/// Recognized data may still have limited support or be invalid for its particular codec.
+/// It isn't recorded with the
 /// browser's installs: the world's data pack list (Home, `worlds datapack-list`) has it.
 pub fn install_datapack(
     source: &dyn Source,
@@ -362,11 +364,14 @@ pub fn install_datapack(
     let result = source.fetch(file, &folder, progress).and_then(|zip| {
         let coverage = crate::datapacks::coverage(&zip)?;
         if coverage.read.is_empty() {
-            return Err(format!(
-                "{} would change nothing in Horizon yet: it has no functions, predicates or item \
-                 modifiers, and Horizon doesn't read its {} yet.",
-                project.title,
+            let details = if coverage.unread.is_empty() {
+                crate::i18n::tr("no data files").to_string()
+            } else {
                 coverage.not_read()
+            };
+            return Err(crate::i18n::trf(
+                "{name} has no supported data pack files. Unsupported or invalid: {details}.",
+                &[("name", &project.title), ("details", &details)],
             ));
         }
         let pack = crate::datapacks::add(world, &zip)?;
