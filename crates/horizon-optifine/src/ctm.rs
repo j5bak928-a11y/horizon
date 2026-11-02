@@ -276,13 +276,20 @@ impl Rule {
         let mut weights: Vec<u32> = get("weights")
             .map(|v| {
                 // By position: a weight that is not a number (`Integer.parseInt`) counts 1.
+                // Extra entries do not affect the probabilities of the listed tiles.
                 v.split_whitespace()
+                    .take(tiles.len())
                     .map(|w| w.parse::<i32>().map_or(1, |w| w.max(0) as u32))
                     .collect()
             })
             .unwrap_or_default();
-        if !weights.is_empty() {
-            weights.resize(tiles.len(), 1);
+        if !weights.is_empty() && weights.len() < tiles.len() {
+            // OptiFine's CTM format fills unspecified weights with the average of the
+            // specified ones, rounded down to an integer. Sum in u64: a pack may
+            // supply 4096 tiles with i32::MAX weights.
+            let average = (weights.iter().map(|&w| u64::from(w)).sum::<u64>()
+                / weights.len() as u64) as u32;
+            weights.resize(tiles.len(), average);
         }
         if weights.iter().all(|&w| w == 0) {
             // Nothing to pick by: every tile alike.
@@ -705,6 +712,61 @@ mod tests {
         .unwrap();
         assert!(legacy.heights.as_ref().unwrap().contains(10));
         assert!(!legacy.heights.as_ref().unwrap().contains(9));
+    }
+
+    #[test]
+    fn partial_random_weights_use_their_average_and_ignore_extras() {
+        // Documented CTM random rule: missing weights receive the average of
+        // the values provided; an extra value must not disable weighting.
+        let r = rule(
+            "random.properties",
+            "matchBlocks=stone\nmethod=random\ntiles=0-3\nweights=7 3",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(r.weights, [7, 3, 5, 5]);
+
+        let r = rule(
+            "random.properties",
+            "matchBlocks=stone\nmethod=random\ntiles=0-1\nweights=1 0 999",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(r.weights, [1, 0]);
+        for x in -16..16 {
+            assert_eq!(
+                connect::random_index([x, 70, 0], connect::Face::North, 0, &r.weights, 2),
+                0,
+                "the impossible tile must never be selected"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_weights_round_down_safely_and_keep_zero_weights() {
+        let r = rule(
+            "random.properties",
+            "matchBlocks=stone\nmethod=random\ntiles=0-2\nweights=0 5",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(r.weights, [0, 5, 2]);
+
+        let r = rule(
+            "random.properties",
+            "matchBlocks=stone\nmethod=random\ntiles=0-3\nweights=2147483647 2147483647",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(r.weights, [i32::MAX as u32; 4]);
+
+        let r = rule(
+            "random.properties",
+            "matchBlocks=stone\nmethod=random\ntiles=0-2\nweights=0",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(r.weights.is_empty(), "all-zero weights pick tiles evenly");
     }
 
     #[test]
